@@ -12,7 +12,6 @@ library(expm)
 library(foreach)
 library(doParallel)
 library(PMA)
-library(future.apply)
 
 # --- Split a single matrix X into a list of blocks, given block sizes pp ---
 make_xlist_from_X <- function(X, pp, block_names = paste0("X", seq_along(pp))) {
@@ -82,11 +81,7 @@ MultiCCA_unsup_cv <- function(
   set.seed(seed)
   fold_id <- sample(rep(seq_len(nfold), length.out = n))
   
-  old_plan <- future::plan()
-  on.exit(future::plan(old_plan), add = TRUE)
-  if (parallel) future::plan(future::multisession, workers = workers) else future::plan(future::sequential)
-  
-  fold_scores <- future_lapply(seq_len(nfold), function(f) {
+  fold_fun <- function(f) {
     tr <- which(fold_id != f)
     te <- which(fold_id == f)
     
@@ -133,7 +128,40 @@ MultiCCA_unsup_cv <- function(
       }
     }
     scores
-  }, future.seed = TRUE)
+  }
+
+  fold_scores <- NULL
+  use_parallel <- isTRUE(parallel) && nfold > 1L && workers > 1L
+  if (use_parallel) {
+    nworkers <- min(as.integer(workers), as.integer(nfold))
+    if (.Platform$OS.type == "unix" && Sys.getenv("RSTUDIO") != "1") {
+      fold_scores <- tryCatch(
+        parallel::mclapply(seq_len(nfold), fold_fun, mc.cores = nworkers),
+        error = function(e) NULL
+      )
+    } else {
+      cl <- tryCatch(parallel::makeCluster(nworkers, type = "PSOCK"), error = function(e) NULL)
+      if (!is.null(cl)) {
+        on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
+        try(parallel::clusterSetRNGStream(cl, iseed = as.integer(seed)), silent = TRUE)
+        parallel::clusterEvalQ(cl, suppressPackageStartupMessages(library(PMA)))
+        parallel::clusterExport(
+          cl,
+          varlist = c("xlist", "fold_id", "nfold", "standardize", "penalty_mat", "L", "niter",
+                      "type", "ncomponents", "trace", "standardize_train_test",
+                      "multicca_score", "fold_fun"),
+          envir = environment()
+        )
+        fold_scores <- tryCatch(
+          parallel::parLapply(cl, seq_len(nfold), fold_fun),
+          error = function(e) NULL
+        )
+      }
+    }
+  }
+  if (is.null(fold_scores)) {
+    fold_scores <- lapply(seq_len(nfold), fold_fun)
+  }
   
   score_mat <- do.call(rbind, fold_scores)   # nfold x L
   cv_mean <- colMeans(score_mat, na.rm = TRUE)
@@ -164,5 +192,4 @@ MultiCCA_unsup_cv <- function(
     fit_full = fit_full
   )
 }
-
 

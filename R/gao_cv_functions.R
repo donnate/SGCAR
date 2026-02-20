@@ -1,6 +1,6 @@
-# gao_gca_cv_fixed.R
+# gao_cv_functions.R
 # ------------------------------------------------------------
-# Fixes for gao_gca_cv_init_and_final():
+# Fixes for gao_gca_cv():
 #  - Respects `parallel` argument (TRUE/FALSE)
 #  - Avoids future/multisession "out of sync" errors by using base parallel::parLapply
 #    (PSOCK by default in RStudio/macOS), with automatic fallback to sequential.
@@ -194,13 +194,13 @@ sgca_tgd_safe <- function(A, B, r, init, k,
 # ------------------------------------------------------------
 # Fixed CV function (no future; stable parallel + fallback)
 # ------------------------------------------------------------
-gao_gca_cv_init_and_final <- function(
+gao_gca_cv <- function(
     X, pp, r, k,
     lambda_grid,
     rho_scale = 1,
     nfold = 5,
     eta = 1e-3,
-    ridge_B = 1e-6,
+    ridge_B =  0,
     ridge_norm = 1e-8,
     nu = 1,
     epsilon = 5e-3,
@@ -208,8 +208,8 @@ gao_gca_cv_init_and_final <- function(
     convergence = 1e-6,
     maxiter_tgd = 15000,
     parallel = TRUE,
-    renorm_by_sigma0 = TRUE,
     center = TRUE,
+    renorm_by_sigma0 = TRUE,
     ncores = max(1, parallel::detectCores() - 1),
     seed = 2023,
     cluster_type = c("auto", "PSOCK", "FORK"),
@@ -234,6 +234,7 @@ gao_gca_cv_init_and_final <- function(
     Xtr <- X[tr, , drop = FALSE]
     Xva <- X[va, , drop = FALSE]
     
+    # Fold-safe centering: estimate means on training fold only.
     if (isTRUE(center)){
       mu <- colMeans(Xtr)
       Xtr <- sweep(Xtr, 2, mu, "-")
@@ -271,12 +272,10 @@ gao_gca_cv_init_and_final <- function(
     ainit <- init_process(ag$Pi, r)
     
     # init-only score
-    U0 <- hard(ainit, k)
-    U0_use <- if (isTRUE(renorm_by_sigma0)){
-      U0 %*% invsqrt_sym(t(U0) %*% B_va %*% U0, ridge = ridge_norm)
-    } else {
-      U0 %*% invsqrt_sym(t(U0) %*% B_tr %*% U0, ridge = ridge_norm)
-    }
+    #U0 <- hard(ainit, k)
+    U0 <- ainit
+    U0_use <- U0 %*% invsqrt_sym(t(U0) %*% B_tr %*% U0, ridge = ridge_norm)
+    
     init_score <- trace_obj(S_va, U0_use)
     
     # final scores across lambdas
@@ -372,7 +371,10 @@ gao_gca_cv_init_and_final <- function(
   final_mean <- colMeans(final_mat, na.rm = TRUE)
   final_sd   <- apply(final_mat, 2, sd, na.rm = TRUE)
   
-  best_lambda_idx <- which.max(replace(final_mean, is.na(final_mean), -Inf))
+  if (!any(is.finite(final_mean))) {
+    stop("All lambda candidates failed in CV (non-finite fold scores).")
+  }
+  best_lambda_idx <- which.max(replace(final_mean, !is.finite(final_mean), -Inf))
   best_lambda <- lambda_grid[best_lambda_idx]
   
   # ---- refit on full data ----
@@ -386,18 +388,28 @@ gao_gca_cv_init_and_final <- function(
   
   rho_full <- rho_scale * sqrt(log(p) / nfull)
   
-  ag_full <- sgca_init_fixed(A = S_full, B = B_full, rho = rho_full, K = r,
-                             nu = nu, epsilon = epsilon, maxiter = maxiter_admm)
+  ag_full <- tryCatch(
+    sgca_init_fixed(A = S_full, B = B_full, rho = rho_full, K = r,
+                    nu = nu, epsilon = epsilon, maxiter = maxiter_admm),
+    error = function(e) NULL
+  )
+  if (is.null(ag_full)) {
+    stop("Full-data sgca_init_fixed failed after CV selection.")
+  }
   ainit_full <- init_process(ag_full$Pi, r)
   
-  U_full_init <- hard(ainit_full, k)
+  #U_full_init <- hard(ainit_full, k)
+  U_full_init <- ainit_full
   U_full_init <- U_full_init %*% invsqrt_sym(t(U_full_init) %*% B_full %*% U_full_init,
                                              ridge = ridge_norm)
   
-  U_full_final <- sgca_tgd_safe(A = S_full, B = B_full, r = r, init = ainit_full, k = k,
-                                lambda = best_lambda, eta = eta,
-                                convergence = convergence, maxiter = maxiter_tgd,
-                                ridge_norm = ridge_norm)
+  U_full_final <- tryCatch(
+    sgca_tgd_safe(A = S_full, B = B_full, r = r, init = ainit_full, k = k,
+                  lambda = best_lambda, eta = eta,
+                  convergence = convergence, maxiter = maxiter_tgd,
+                  ridge_norm = ridge_norm),
+    error = function(e) matrix(NA_real_, nrow = p, ncol = r)
+  )
   
   list(
     rho_scale = rho_scale,
@@ -421,4 +433,62 @@ gao_gca_cv_init_and_final <- function(
     # bookkeeping
     did_parallel = did_parallel
   )
+}
+
+
+
+fantope <- function(
+    X, pp, r, k,
+    lambda_grid,
+    rho_scale = 1,
+    nfold = 5,
+    eta = 1e-3,
+    ridge_B = 1e-6,
+    ridge_norm = 1e-8,
+    nu = 1,
+    epsilon = 5e-3,
+    maxiter_admm = 1000,
+    convergence = 1e-6,
+    maxiter_tgd = 15000,
+    parallel = TRUE,
+    renorm_by_sigma0 = TRUE,
+    center = TRUE,
+    ncores = max(1, parallel::detectCores() - 1),
+    seed = 2023,
+    cluster_type = c("auto", "PSOCK", "FORK"),
+    verbose = TRUE
+){
+  
+  cluster_type <- match.arg(cluster_type)
+  X <- as.matrix(X)
+  n <- nrow(X); p <- ncol(X)
+  if (sum(pp) != p) stop("sum(pp) must equal ncol(X).")
+  Mask <- make_mask_pp(pp)
+  
+  # ---- refit on full data ----
+  Xfull <- if (isTRUE(center)) scale(X, center = TRUE, scale = FALSE) else X
+  nfull <- nrow(Xfull)
+  
+  S_full <- crossprod(Xfull) / nfull; S_full <- (S_full + t(S_full))/2
+  B_full <- S_full * Mask
+  if (ridge_B > 0) B_full <- B_full + ridge_B * diag(p)
+  B_full <- (B_full + t(B_full))/2
+  
+  rho_full <- rho_scale * sqrt(log(p) / nfull)
+  
+  ag_full <- sgca_init_fixed(A = S_full, B = B_full, rho = rho_full, K = r,
+                             nu = nu, epsilon = epsilon, maxiter = maxiter_admm)
+  ainit_full <- init_process(ag_full$Pi, r)
+  
+  #U_full_init <- hard(ainit_full, k)
+  U_full_init <- ainit_full
+  U_full_init <- U_full_init %*% invsqrt_sym(t(U_full_init) %*% B_full %*% U_full_init,
+                                             ridge = ridge_norm)
+  
+  return(list(
+    rho_scale = rho_scale,
+    rho_full = rho_full,
+    # full-data canonical vectors
+    U_full_init = U_full_init
+  ))
 }

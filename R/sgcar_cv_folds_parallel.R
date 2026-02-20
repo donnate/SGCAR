@@ -29,17 +29,455 @@ sym_inv_sqrt <- function(S, eps = 1e-10) {
 top_eigs_sym <- function(A, r) {
   A <- (A + t(A))/2
   if (requireNamespace("RSpectra", quietly = TRUE) && r < nrow(A)) {
-    out <- RSpectra::eigs_sym(A, k = r, which = "LM")
-    list(values = Re(out$values), vectors = Re(out$vectors))
+    out <- RSpectra::eigs_sym(A, k = r, which = "LA")
+    o <- order(Re(out$values), decreasing = TRUE)
+    list(values = Re(out$values)[o],
+         vectors = Re(out$vectors)[, o, drop = FALSE])
   } else {
     ev <- eigen(A, symmetric = TRUE)
-    list(values = ev$values[seq_len(r)], vectors = ev$vectors[, seq_len(r), drop = FALSE])
+    list(values = ev$values[seq_len(r)],
+         vectors = ev$vectors[, seq_len(r), drop = FALSE])
   }
 }
+
+
+top_eigs_sym <- function(A, r) {
+  A <- (A + t(A))/2
+  if (requireNamespace("RSpectra", quietly = TRUE) && r < nrow(A)) {
+    out <- RSpectra::eigs_sym(A, k = r, which = "LA")
+    o <- order(Re(out$values), decreasing = TRUE)
+    list(values = Re(out$values)[o],
+         vectors = Re(out$vectors)[, o, drop = FALSE])
+  } else {
+    ev <- eigen(A, symmetric = TRUE)
+    list(values = ev$values[seq_len(r)],
+         vectors = ev$vectors[, seq_len(r), drop = FALSE])
+  }
+}
+
+extract_U_canon <- function(C_tilde, U0_blocks, lam_blocks, r = 1, use_dense = TRUE) {
+  lam2 <- unlist(lam_blocks, use.names = FALSE)
+  lam2 <- pmax(as.numeric(lam2), 1e-12)
+  sqrt_lam2 <- sqrt(lam2)
+
+  # target_tilde = diag(sqrt_lam2) C_tilde diag(sqrt_lam2)  (no diag() construction)
+  target_tilde <- C_tilde * sqrt_lam2
+  target_tilde <- t(t(target_tilde) * sqrt_lam2)
+  target_tilde <- (target_tilde + t(target_tilde))/2
+
+  eg <- top_eigs_sym(target_tilde, r)
+  V  <- eg$vectors
+  mu <- eg$values
+
+  # U_tilde = diag(1/sqrt_lam2) V   (rowwise divide)
+  U_tilde <- V / sqrt_lam2
+
+  # map back: U = U0 %*% U_tilde
+  if (use_dense) {
+    U0 <- as.matrix(Matrix::bdiag(U0_blocks))
+    U <- U0 %*% U_tilde
+  } else {
+    # blockwise apply
+    U <- {
+      p_sizes <- vapply(U0_blocks, nrow, integer(1))
+      k_sizes <- vapply(U0_blocks, ncol, integer(1))
+      p_offs  <- c(0L, cumsum(p_sizes))
+      k_offs  <- c(0L, cumsum(k_sizes))
+      out <- matrix(0, sum(p_sizes), ncol(U_tilde))
+      for (i in seq_along(U0_blocks)) {
+        pi <- (p_offs[i] + 1L):p_offs[i + 1L]
+        ki <- (k_offs[i] + 1L):k_offs[i + 1L]
+        out[pi, ] <- U0_blocks[[i]] %*% U_tilde[ki, , drop = FALSE]
+      }
+      out
+    }
+  }
+
+  # renormalize to enforce U^T Sigma0 U = I (numerically stable, uses lam2)
+  B <- crossprod(U_tilde, U_tilde * lam2)  # = U^T Sigma0 U in tilde coords
+  U <- U %*% sym_inv_sqrt(B)
+
+  list(U = U, evals = mu)
+}
+
+
 
 .block_indices <- function(plist) {
   edges <- c(0, cumsum(plist))
   lapply(seq_along(plist), function(i) (edges[i] + 1):edges[i + 1])
+}
+
+# ------------------------------------------------------------
+# Helper: blockwise Ledoit–Wolf Sigma0 (block diagonal)
+# Computes Sigma0 = bdiag( LWcov(X_block1), LWcov(X_block2), ... )
+# ------------------------------------------------------------
+.lw_sigma0_blockdiag <- function(X, rows, idxs, center = FALSE) {
+  if (!requireNamespace("cvCovEst", quietly = TRUE)) {
+    stop("Package 'cvCovEst' is required for Ledoit–Wolf shrinkage.")
+  }
+  if (!requireNamespace("Matrix", quietly = TRUE)) {
+    stop("Package 'Matrix' is required for bdiag().")
+  }
+  
+  blocks <- lapply(idxs, function(id) {
+    dat <- X[rows, id, drop = FALSE]
+    if (isTRUE(center)) dat <- scale(dat, center = TRUE, scale = FALSE)
+    cvCovEst::linearShrinkLWEst(dat = dat)
+  })
+  
+  S0 <- as.matrix(Matrix::bdiag(blocks))
+  (S0 + t(S0)) / 2
+}
+
+
+library(Matrix)
+
+svd_block <- function(Xi, n, eps = 1e-8) {
+  s <- svd(Xi / sqrt(n))
+  lam <- s$d^2
+  keep <- lam > eps
+  list(lam = lam[keep], U = s$v[, keep, drop = FALSE])
+}
+
+
+
+block_eigen <- function(X_list, eps = 1e-8) {
+  # X_list: list of matrices X_i (n x p_i) or (m_i x p_i) depending on your n usage
+  # n: the scaling used in X_i^T X_i / n
+  # returns: list with per-block eigenvectors/values + offsets for embedding
+  # Note: this all assumes X_list is centered
+
+  p_sizes <- vapply(X_list, ncol, integer(1))
+  n <- nrow(X_list[[1]])
+  offsets <- c(0L, cumsum(p_sizes))  # offsets[j] .. offsets[j+1]-1 is block j
+
+  U_blocks  <- vector("list", length(X_list))
+  lam_blocks <- vector("list", length(X_list))
+
+  for (i in seq_along(X_list)) {
+    Xi <- X_list[[i]]
+    if (nrow(Xi)< p_sizes[i]){
+      #### Block has more features than samples, so we do SVD instead of EVD for numerical stability
+      svd_res <- svd_block(Xi, n, eps)
+      lam_blocks[[i]] <- svd_res$lam
+      U_blocks[[i]] <- svd_res$U
+    }else{
+      # form block Gram; if p_i is moderate this is fine and much smaller than full Sigma0
+      Si <- crossprod(Xi) / n
+      ev <- eigen(Si, symmetric = TRUE)
+      keep <- ev$values > eps
+      lam_blocks[[i]] <- pmax(ev$values[keep], 0)
+      U_blocks[[i]]   <- ev$vectors[, keep, drop = FALSE]
+    }
+
+
+  }
+
+  list(
+    lam_blocks = lam_blocks,
+    U_blocks   = U_blocks,
+    offsets    = offsets,
+    p_sizes    = p_sizes
+  )
+}
+
+
+Utb <- function(U_blocks, p_sizes, b) {
+  offsets <- c(0L, cumsum(p_sizes))
+  out <- vector("list", length(U_blocks))
+
+  for (i in seq_along(U_blocks)) {
+    lo <- offsets[i] + 1L
+    hi <- offsets[i + 1L]
+    out[[i]] <- crossprod(U_blocks[[i]], b[lo:hi])
+  }
+
+  unlist(out, use.names = FALSE)
+}
+
+Uc <- function(U_blocks, p_sizes, c) {
+  offsets <- c(0L, cumsum(p_sizes))
+  out <- numeric(sum(p_sizes))
+  pos <- 0L
+
+  for (i in seq_along(U_blocks)) {
+    k_i <- ncol(U_blocks[[i]])
+    coeff_i <- c[(pos+1):(pos+k_i)]
+    lo <- offsets[i] + 1L
+    hi <- offsets[i + 1L]
+    out[lo:hi] <- U_blocks[[i]] %*% coeff_i
+    pos <- pos + k_i
+  }
+
+  out
+}
+
+Utb_blocks <- function(U_blocks, B_blocks) {
+  stopifnot(is.list(U_blocks), is.list(B_blocks))
+  stopifnot(length(U_blocks) == length(B_blocks))
+
+  out <- vector("list", length(U_blocks))
+
+  for (i in seq_along(U_blocks)) {
+    Ui <- U_blocks[[i]]
+    Bi <- B_blocks[[i]]
+
+    # allow Bi to be a vector; treat it as a 1-column matrix
+    if (is.null(dim(Bi))) Bi <- matrix(Bi, ncol = 1)
+
+    stopifnot(nrow(Ui) == nrow(Bi))  # p_i matches
+    out[[i]] <- crossprod(Ui, Bi)    # (k_i x p_i) %*% (p_i x m) = (k_i x m)
+  }
+
+  do.call(rbind, out)  # stack along rows: total_k x m
+}
+
+library(Matrix)
+
+UtAU_block <- function(U_blocks, A, symmetric_A = TRUE) {
+  B <- length(U_blocks)
+  p_sizes <- vapply(U_blocks, nrow, integer(1))
+  offs <- c(0L, cumsum(p_sizes))
+
+  Sigma_blocks <- vector("list", B)
+
+  for (i in seq_len(B)) {
+    Sigma_blocks[[i]] <- vector("list", B)
+    Ui <- U_blocks[[i]]
+    ii <- (offs[i] + 1L):offs[i + 1L]
+
+    # if A is symmetric, only compute j>=i and mirror
+    j_start <- if (symmetric_A) i else 1L
+
+    for (j in j_start:B) {
+      Uj <- U_blocks[[j]]
+      jj <- (offs[j] + 1L):offs[j + 1L]
+
+      Aij <- A[ii, jj, drop = FALSE]          # p_i x p_j
+      Sigma_blocks[[i]][[j]] <- crossprod(Ui, Aij %*% Uj)  # k_i x k_j
+
+      if (symmetric_A && j != i) {
+        # mirror
+        # (Uj^T Aji Ui) = (Ui^T Aij Uj)^T when A symmetric
+        # store later if you want a full block list
+      }
+    }
+  }
+
+  # Convert block list -> sparse block matrix (or dense if you as.matrix it)
+  # If symmetric and you only computed upper triangle, fill the lower:
+  if (symmetric_A) {
+    for (i in seq_len(B)) {
+     if (i <= 1L) next
+      for (j in seq_len(i - 1L)) {
+        Sigma_blocks[[i]][[j]] <- t(Sigma_blocks[[j]][[i]])
+      }
+    }
+  }
+
+  bdiag_result <- do.call(rbind, lapply(Sigma_blocks, function(row) do.call(cbind, row)))
+  # bdiag_result is a standard matrix if blocks are base matrices; keep as Matrix if you prefer
+  bdiag_result
+}
+
+
+U_apply_mat <- function(U_blocks, V_tilde) {
+  # U0 %*% V_tilde where U0 = bdiag(U_blocks)
+  # V_tilde: r_all x r  with r_all = sum k_i
+  k_sizes <- vapply(U_blocks, ncol, integer(1))
+  k_offs  <- c(0L, cumsum(k_sizes))
+  p_sizes <- vapply(U_blocks, nrow, integer(1))
+  p_offs  <- c(0L, cumsum(p_sizes))
+
+  p_all <- sum(p_sizes)
+  r <- ncol(V_tilde)
+  out <- matrix(0, p_all, r)
+
+  for (i in seq_along(U_blocks)) {
+    Ui <- U_blocks[[i]]
+    ki <- k_sizes[i]
+    if (ki == 0L) next
+    ki_idx <- (k_offs[i] + 1L):k_offs[i + 1L]
+    pi_idx <- (p_offs[i] + 1L):p_offs[i + 1L]
+
+    out[pi_idx, ] <- Ui %*% V_tilde[ki_idx, , drop = FALSE]
+  }
+  out
+}
+
+
+
+prox_l1_from_tilde_blockwise <- function(W_tilde,
+                                         U_blocks,
+                                         tau,
+                                         symmetric = TRUE,
+                                         drop_tol = 0) {
+
+  B <- length(U_blocks)
+
+  p_sizes <- vapply(U_blocks, nrow, integer(1))
+  k_sizes <- vapply(U_blocks, ncol, integer(1))
+
+  p_offs <- c(0L, cumsum(p_sizes))
+  k_offs <- c(0L, cumsum(k_sizes))
+
+  p_all <- sum(p_sizes)
+
+  # collect sparse triplets
+  I_all <- list()
+  J_all <- list()
+  X_all <- list()
+  counter <- 0L
+
+  for (i in seq_len(B)) {
+
+    Ui <- U_blocks[[i]]
+    pi <- p_sizes[i]
+    ki_idx <- (k_offs[i] + 1L):k_offs[i + 1L]
+    row_offset <- p_offs[i]
+
+    j_start <- if (symmetric) i else 1L
+
+    for (j in j_start:B) {
+
+      Uj <- U_blocks[[j]]
+      pj <- p_sizes[j]
+      kj_idx <- (k_offs[j] + 1L):k_offs[j + 1L]
+      col_offset <- p_offs[j]
+
+      # extract small tilde block
+      W_ij <- W_tilde[ki_idx, kj_idx, drop = FALSE]
+
+      # reconstruct this block only
+      # (p_i x k_i) %*% (k_i x k_j) %*% (k_j x p_j)
+      block_ij <- Ui %*% W_ij %*% t(Uj)
+
+      # soft threshold
+      block_ij <- sign(block_ij) * pmax(abs(block_ij) - tau, 0)
+
+      if (drop_tol > 0)
+        block_ij[abs(block_ij) <= drop_tol] <- 0
+
+      nz <- which(block_ij != 0, arr.ind = TRUE)
+      if (nrow(nz) == 0) next
+
+      counter <- counter + 1L
+
+      I_all[[counter]] <- row_offset + nz[,1]
+      J_all[[counter]] <- col_offset + nz[,2]
+      X_all[[counter]] <- block_ij[nz]
+
+      if (symmetric && i != j) {
+        counter <- counter + 1L
+        I_all[[counter]] <- col_offset + nz[,2]
+        J_all[[counter]] <- row_offset + nz[,1]
+        X_all[[counter]] <- block_ij[nz]
+      }
+    }
+  }
+
+  if (counter == 0L)
+    return(Matrix(0, p_all, p_all, sparse = TRUE))
+
+  I <- unlist(I_all, use.names = FALSE)
+  J <- unlist(J_all, use.names = FALSE)
+  X <- unlist(X_all, use.names = FALSE)
+
+  sparseMatrix(i = I, j = J, x = X,
+               dims = c(p_all, p_all),
+               giveCsparse = TRUE)
+}
+
+
+UAUt_block_sparse <- function(U_blocks,
+                              A,
+                              symmetric_A = TRUE,
+                              chunk_cols = 512L,
+                              drop_tol = 0) {
+  B <- length(U_blocks)
+
+  p_sizes <- vapply(U_blocks, nrow, integer(1))
+  k_sizes <- vapply(U_blocks, ncol, integer(1))
+
+  p_offs <- c(0L, cumsum(p_sizes))
+  k_offs <- c(0L, cumsum(k_sizes))
+
+  p_all <- sum(p_sizes)
+  r_all <- sum(k_sizes)
+  stopifnot(all(dim(A) == c(r_all, r_all)))
+
+  if (symmetric_A) A <- (A + t(A)) / 2
+
+  # triplet collectors
+  I_all <- list(); J_all <- list(); X_all <- list()
+  counter <- 0L
+  add_trip <- function(I, J, X) {
+    counter <<- counter + 1L
+    I_all[[counter]] <<- I
+    J_all[[counter]] <<- J
+    X_all[[counter]] <<- X
+  }
+
+  for (i in seq_len(B)) {
+    Ui <- U_blocks[[i]]
+    pi <- p_sizes[i]
+    ki <- k_sizes[i]
+    if (ki == 0L) next
+
+    ii0 <- p_offs[i]
+    ki_idx <- (k_offs[i] + 1L):k_offs[i + 1L]
+
+    j_start <- if (symmetric_A) i else 1L
+
+    for (j in j_start:B) {
+      Uj <- U_blocks[[j]]
+      pj <- p_sizes[j]
+      kj <- k_sizes[j]
+      if (kj == 0L) next
+
+      jj0 <- p_offs[j]
+      kj_idx <- (k_offs[j] + 1L):k_offs[j + 1L]
+
+      Aij <- A[ki_idx, kj_idx, drop = FALSE]  # k_i x k_j
+      if (all(Aij == 0)) next
+
+      # compute M_ij = (Ui %*% Aij) %*% t(Uj), but chunk columns of Uj to limit memory
+      Mleft <- Ui %*% Aij  # p_i x k_j
+
+      for (start in seq(1L, pj, by = chunk_cols)) {
+        end <- min(pj, start + chunk_cols - 1L)
+        cols <- start:end
+        Uj_chunk <- Uj[cols, , drop = FALSE]          # (len x k_j)
+
+        blk <- Mleft %*% t(Uj_chunk)                  # (p_i x len)
+
+        if (drop_tol > 0) blk[abs(blk) <= drop_tol] <- 0
+        nz <- which(blk != 0, arr.ind = TRUE)
+        if (nrow(nz) == 0L) next
+
+        I <- ii0 + nz[, 1L]
+        J <- jj0 + cols[nz[, 2L]]
+        X <- blk[nz]
+
+        add_trip(I, J, X)
+
+        if (symmetric_A && i != j) {
+          # mirror without recomputing
+          add_trip(J, I, X)
+        }
+      }
+    }
+  }
+
+  if (counter == 0L) return(Matrix(0, p_all, p_all, sparse = TRUE))
+
+  I <- unlist(I_all, use.names = FALSE)
+  J <- unlist(J_all, use.names = FALSE)
+  X <- unlist(X_all, use.names = FALSE)
+
+  Z <- sparseMatrix(i = I, j = J, x = X, dims = c(p_all, p_all), giveCsparse = TRUE)
+  if (drop_tol > 0) Z <- drop0(Z, tol = drop_tol)
+  Z
 }
 
 
@@ -60,7 +498,9 @@ top_eigs_sym <- function(A, r) {
 }
 
 ## row/group proxes only used if you select penalties other than "l1"
-.prox_l21_rows <- function(X, tau, mask, row_weights) {
+.prox_l21_rows <- function(X, tau, mask = NULL, row_weights = NULL) {
+  if (is.null(mask)) mask <- matrix(1, nrow(X), ncol(X))
+  if (is.null(row_weights)) row_weights <- rep(1, nrow(X))
   Z <- X
   p <- nrow(X)
   for (i in seq_len(p)) {
@@ -110,7 +550,6 @@ top_eigs_sym <- function(A, r) {
 #   - RSpectra   : faster top eigenvectors
 #   - RhpcBLASctl: control BLAS/OMP threads per worker
 #
-# Author: generated by ChatGPT
 # -------------------------------------------------------------------
 
 # ---- null coalescing (avoid tidyverse dependency) ----
@@ -202,256 +641,351 @@ setup_parallel_backend <- function(num_cores = NULL, verbose = FALSE) {
 }
 
 # Held-out loss: Frobenius norm of residual in the same objective used in training.
-.cv_loss <- function(U_hat, Sigma_val, p_list) {
-  Sigma_val0 = .bd_from_S(Sigma_val, p_list)
-  normalization = t(U_hat) %*% Sigma_val0 %*% U_hat
-  return(-sum(diag(solve(normalization) %*% t(U_hat) %*% Sigma_val %*% U_hat)))
+.cv_loss <- function(U_hat, X_val, p_list) {
+  X_val <- as.matrix(X_val)
+  if (is.null(dim(U_hat))) {
+    U_hat <- matrix(U_hat, ncol = 1L)
+  } else {
+    U_hat <- as.matrix(U_hat)
+  }
+  if (nrow(U_hat) != ncol(X_val)) {
+    stop(sprintf(".cv_loss: incompatible dimensions: nrow(U_hat)=%d, ncol(X_val)=%d",
+                 nrow(U_hat), ncol(X_val)))
+  }
+
+  n <- nrow(X_val)
+  p <- ncol(X_val)
+  r <- ncol(U_hat)
+  
+  if (sum(colSums(U_hat^2) == 0) ==r ){
+    #### In that case, there is an issue --- U_hat is not a proper solution, so we return a very high loss
+    return(1e8)
+  }
+  if (n > p) {
+    Sigma_val <- crossprod(X_val) / n
+    Sigma_val0 <- .bd_from_S(Sigma_val, p_list)
+    return(-sum(diag(t(U_hat) %*% Sigma_val0 %*% U_hat)))
+  }
+  XU <- X_val %*% U_hat
+  return(-sum(diag((t(XU) %*% XU) / n)))
+  #normalization = t(U_hat) %*% Sigma_val0 %*% U_hat
+  #return(-sum(diag(solve(normalization) %*% t(U_hat) %*% Sigma_val %*% U_hat)))
 }
 
 # -------------------------------------------------------------------
 # Warm-startable ADMM core (split into prepare + run)
 # -------------------------------------------------------------------
 
-# Prepare constants for repeated lambda fits on the *same* (Sigma, Sigma0).
-# This is what makes the warm-start path efficient.
-.admm_sgca_prepare <- function(Sigma, Sigma0,
-                              rho = NA,
-                              p_list = NULL,
-                              penalty = c("l1", "l21_rows", "l21_groups"),
-                              penalize = c("offdiag", "all", "block"),
-                              weight = NULL,
-                              row_weights = NULL,
-                              groups_l21 = NULL,
-                              group_weights = NULL,
-                              symmetrize_z = TRUE,
-                              sparsity_threshold = 1e-4) {
-
+# Prepare constants for repeated lambda fits on the same covariance pair.
+.admm_sgca_prepare <- function(X, 
+                               rho = NA,
+                               p_list = NULL,
+                               penalty = c("l1", "l21_rows", "l21_groups"),
+                               groups_l21 = NULL,
+                               symmetrize_z = TRUE,
+                               sparsity_threshold = 1e-4,
+                               eps = 1e-5) {
   penalty <- match.arg(penalty)
-  penalize <- match.arg(penalize)
-  
-
-
-  Sigma <- (Sigma + t(Sigma)) / 2
-  Sigma0 <- (Sigma0 + t(Sigma0)) / 2
-
-  p_all <- nrow(Sigma0)
-
-  # EVD of Sigma0
-  ev0 <- eigen(Sigma0, symmetric = TRUE)
-  U0 <- ev0$vectors
-  lam2 <- pmax(ev0$values, 0)
-  Lam2 <- diag(lam2, nrow = length(lam2))
-  
-  if (is.na(rho)){
-    d <- lam2
-    rho  = stats::median(outer(d^2, d^2))
+  X_list <- if (is.null(p_list)) list(X) else {
+    idxs <- .block_indices(p_list)
+    lapply(idxs, function(id) X[, id, drop = FALSE])
   }
+  n <- nrow(X)
 
-  # constants for the C update in Sigma0-basis
-  Sigma_tilde <- matmul(t(U0), matmul(Sigma, U0))
-  const_rhs <- matmul(matmul(Lam2, Sigma_tilde), Lam2)
 
-  outer_term <- outer(lam2^2, lam2^2, `*`)
-  denom <- rho + outer_term
+  p_all <- sum(vapply(X_list, ncol, integer(1)))
 
-  # masks & weights for l1 / l21_rows
-  mask <- matrix(1, p_all, p_all)
-  if (penalize == "offdiag") diag(mask) <- 0
-  if (penalize == "block") {
-    stopifnot(!is.null(p_list), sum(p_list) == p_all)
-    count <- 0L
-    for (u in p_list) {
-      mask[(count + 1L):(count + u), (count + 1L):(count + u)] <- 0
-      count <- count + u
+
+  U_blocks <- vector("list", length(p_list))
+  lam_blocks <- vector("list", length(p_list))
+  for (i in seq_along(p_list)) {
+    if (p_list[i] <n){
+      S0i <- t(X_list[[i]]) %*% (X_list[[i]]) / n
+      ev <- eigen(S0i, symmetric = TRUE)
+      keep <- ev$values > eps
+      if (!any(keep)) keep[which.max(ev$values)] <- TRUE
+      lam_blocks[[i]] <- pmax(ev$values[keep], eps)
+      U_blocks[[i]] <- ev$vectors[, keep, drop = FALSE]
+
+    }else{
+      ev <- svd(X_list[[i]])
+      lam <- ev$d^2 / n
+      keep <- lam > eps
+      if (!any(keep)) keep[which.max(lam)] <- TRUE
+      lam_blocks[[i]] <- lam[keep]
+      U_blocks[[i]] <- ev$v[, keep, drop = FALSE]
     }
+
   }
+  
 
-  if (is.null(weight)) weight <- matrix(1, p_all, p_all)
-  if (is.null(row_weights)) row_weights <- rep(1, p_all)
 
-  # Sigma0^(1/2) (only needed if you later compute canonical directions)
-  Sigma0_sqrt <- matmul(U0, matmul(diag(sqrt(lam2), nrow = length(lam2)), t(U0)))
+  lam2 <- unlist(lam_blocks, use.names = FALSE)
+  Lam2 <- diag(lam2, nrow = length(lam2))
+  if (p_all <n){
+    #### then it's better to compute Sigma
+    X = do.call(cbind, X_list)
+    Sigma <- crossprod(X) / n
+    Sigma_tilde <- as.matrix(UtAU_block(U_blocks = U_blocks, A = Sigma, symmetric_A = TRUE))
+  } else{
+    #### do not compute Sigma, but directly compute Sigma_tilde = U^T Sigma U = U^T (X^T X / n) U = (U^T X^T) (X U) / n
+    # We can compute U^T X^T:
+    UtXt = Utb_blocks(U_blocks = U_blocks, B_blocks = lapply(X_list, t)) #### this is r_all x n
+    Sigma_tilde = matmul(UtXt, t(UtXt)) / n
+  }
+ 
+  const_rhs <- Lam2 %*% Sigma_tilde %*% Lam2
+  outer_term <- outer(lam2^2, lam2^2, `*`)
 
+  if (is.na(rho)) {
+    rho <- stats::median(outer_term)
+    if (!is.finite(rho) || rho <= 0) rho <- 1
+  }
+  kappa0 <- max(lam2) / min(lam2)   # condition number of Sigma0 in your basis
+
+
+  if (is.null(groups_l21)) groups_l21 <- list()
   list(
     p_all = p_all,
-    Sigma0 = Sigma0,
-    U0 = U0,
-    lam2 = lam2,
-    Lam2 = Lam2,
+    Sigma0_eigen = list(lam_blocks = lam_blocks, U_blocks = U_blocks, p_sizes = p_list),
     const_rhs = const_rhs,
     outer_term = outer_term,
-    denom = denom,
+    denom = rho + outer_term,
     rho = rho,
+    lam2 = lam2,
+    kappa0 = kappa0,
     penalty = penalty,
-    penalize = penalize,
     p_list = p_list,
-    mask = mask,
-    weight = weight,
-    row_weights = row_weights,
-    groups_l21 = groups_l21 %||% list(),
-    group_weights = group_weights,
+    groups_l21 = groups_l21,
     symmetrize_z = symmetrize_z,
-    sparsity_threshold = sparsity_threshold,
-    Sigma0_sqrt = Sigma0_sqrt
+    sparsity_threshold = sparsity_threshold
   )
 }
 
 # Run ADMM for a single lambda, with optional warm start.
 .admm_sgca_run <- function(prep,
-                          lambda,
-                          r,
-                          init = NULL,
-                          warm_start = c("CZU", "C_only", "none"),
-                          max_iter = 4000,
-                          abs_tol = 1e-4,
-                          rel_tol = 1e-3,
-                          adapt_rho = FALSE,
-                          mu = 10,
-                          tau_incr = 2,
-                          tau_decr = 2,
-                          verbose = FALSE,
-                          compute_canon = FALSE) {
-
+                           lambda,
+                           r,
+                           init = NULL,
+                           warm_start = c("CZU", "C_only", "none"),
+                           representation = c("auto", "dense", "sparse"),
+                           dense_dim_threshold = 2000L,
+                           sparse_density_threshold = 0.10,
+                           max_iter = 4000,
+                           abs_tol = 1e-4,
+                           rel_tol = 1e-3,
+                           adapt_rho = FALSE,
+                           mu = 10,
+                           tau_incr = 2,
+                           tau_decr = 2,
+                           verbose = FALSE,
+                           compute_canon = FALSE) {
   warm_start <- match.arg(warm_start)
-
+  representation <- match.arg(representation)
+  
   p_all <- prep$p_all
-  U0 <- prep$U0
-  lam2 <- prep$lam2
+  U0_blocks <- prep$Sigma0_eigen$U_blocks
   const_rhs <- prep$const_rhs
   outer_term <- prep$outer_term
-
   rho <- prep$rho
   denom <- prep$denom
-
-  # init states
-  C <- matrix(0, p_all, p_all)
-  Z <- C
-  U_dual <- C
-
+  
+  k_sizes <- vapply(U0_blocks, ncol, integer(1))
+  r_tot <- sum(k_sizes)
+  C_tilde <- matrix(0, r_tot, r_tot)
+  Z_tilde <- C_tilde
+  U_dual_tilde <- C_tilde
+  
+  use_dense <- switch(
+    representation,
+    dense = TRUE,
+    sparse = FALSE,
+    auto = {
+      if (!is.null(init$mode)) {
+        identical(init$mode, "dense")
+      } else if (!is.null(init$Z) && inherits(init$Z, "sparseMatrix")) {
+        Matrix::nnzero(init$Z) / (p_all * p_all) > sparse_density_threshold
+      } else {
+        p_all <= as.integer(dense_dim_threshold)
+      }
+    }
+  )
+  
+  U0 <- NULL
+  if (use_dense) U0 <- as.matrix(Matrix::bdiag(U0_blocks))
+  
+  apply_U_blocks <- function(U_blocks, V) {
+    k_offs <- c(0L, cumsum(vapply(U_blocks, ncol, integer(1))))
+    out <- vector("list", length(U_blocks))
+    for (i in seq_along(U_blocks)) {
+      ki <- (k_offs[i] + 1L):k_offs[i + 1L]
+      out[[i]] <- U_blocks[[i]] %*% V[ki, , drop = FALSE]
+    }
+    do.call(rbind, out)
+  }
+  
   if (!is.null(init) && warm_start != "none") {
-    if (!is.null(init$C) && all(dim(init$C) == c(p_all, p_all))) C <- init$C
+    if (!is.null(init$C_tilde) && all(dim(init$C_tilde) == c(r_tot, r_tot))) C_tilde <- init$C_tilde
     if (warm_start == "CZU") {
-      if (!is.null(init$Z) && all(dim(init$Z) == c(p_all, p_all))) Z <- init$Z else Z <- C
-      if (!is.null(init$U_dual) && all(dim(init$U_dual) == c(p_all, p_all))) U_dual <- init$U_dual
+      if (!is.null(init$Z_tilde) && all(dim(init$Z_tilde) == c(r_tot, r_tot))) Z_tilde <- init$Z_tilde else Z_tilde <- C_tilde
+      if (!is.null(init$U_dual_tilde) && all(dim(init$U_dual_tilde) == c(r_tot, r_tot))) U_dual_tilde <- init$U_dual_tilde
+      if (!is.null(init$Z)) Z <- init$Z
       if (!is.null(init$rho) && is.finite(init$rho)) {
         rho <- as.numeric(init$rho)
         denom <- rho + outer_term
       }
     } else if (warm_start == "C_only") {
-      Z <- C
-      U_dual <- matrix(0, p_all, p_all)
+      Z_tilde <- C_tilde
+      U_dual_tilde <- matrix(0, r_tot, r_tot)
     }
   }
-
+  
   penalty <- prep$penalty
-  mask <- prep$mask
-  weight <- prep$weight
-  row_weights <- prep$row_weights
   groups_l21 <- prep$groups_l21
-  group_weights <- prep$group_weights
   symmetrize_z <- prep$symmetrize_z
-
-  converged <- FALSE
-  iter_final <- 0L
-
-  for (iter in seq_len(max_iter)) {
-    iter_final <- iter
-    Z_prev <- Z
-
-    # ----- C update (closed form) -----
-    rhs_tilde <- rho * matmul(t(U0), matmul(Z - U_dual, U0)) + const_rhs
-    C_tilde <- rhs_tilde / denom
-    C <- matmul(U0, matmul(C_tilde, t(U0)))
-
-    # ----- Z update (prox) -----
-    Z_tilde <- C + U_dual
-    if (penalty == "l1") {
-      if (all(weight == 1) && all(mask == 1)) {
-        Z <- soft_threshold(Z_tilde, lambda / rho)
+  if (lambda == 0 && penalty == "l1") {
+    lam2 <- prep$lam2
+    lam_outer <- outer(lam2, lam2, `*`)
+    C_tilde <- prep$Sigma_tilde / lam_outer
+    C_tilde <- (C_tilde + t(C_tilde))/2
+    return(list(C_tilde=C_tilde, iter=0L, converged=TRUE, rho=NA_real_))
+  }else{
+    converged <- FALSE
+    iter_final <- 0L
+    for (iter in seq_len(max_iter)) {
+      iter_final <- iter
+      Z_tilde_prev <- Z_tilde
+      
+      rhs_tilde <- rho * (Z_tilde - U_dual_tilde) + const_rhs
+      C_tilde <- rhs_tilde / denom
+      
+      W_tilde <- C_tilde + U_dual_tilde
+      if (penalty == "l1") {
+        if (use_dense) {
+          W <- U0 %*% W_tilde %*% t(U0)
+          Z <- soft_threshold(W, lambda / rho)
+          if (symmetrize_z) Z <- (Z + t(Z)) / 2
+          Z_tilde <- crossprod(U0, Z %*% U0)
+        } else {
+          Z <- prox_l1_from_tilde_blockwise(
+            W_tilde = W_tilde,
+            U_blocks = U0_blocks,
+            tau = lambda / rho,
+            symmetric = TRUE,
+            drop_tol = prep$sparsity_threshold
+          )
+          if (symmetrize_z) Z <- (Z + t(Z)) / 2
+          z_density <- Matrix::nnzero(Z) / (p_all * p_all)
+          if (z_density > sparse_density_threshold && p_all <= 2L * as.integer(dense_dim_threshold)) {
+            U0 <- as.matrix(Matrix::bdiag(U0_blocks))
+            use_dense <- TRUE
+            Z <- as.matrix(Z)
+            Z_tilde <- crossprod(U0, Z %*% U0)
+          } else {
+            Z_tilde <- as.matrix(UtAU_block(U_blocks = U0_blocks, A = Z, symmetric_A = TRUE))
+          }
+        }
+      } else if (penalty == "l21_rows") {
+        W <- if (use_dense) {
+          U0 %*% W_tilde %*% t(U0)
+        } else {
+          as.matrix(prox_l1_from_tilde_blockwise(
+            W_tilde = W_tilde,
+            U_blocks = U0_blocks,
+            tau = 0,
+            symmetric = TRUE,
+            drop_tol = 0
+          ))
+        }
+        Z <- .prox_l21_rows(W, tau = (lambda / rho), mask = mask, row_weights = row_weights)
+        if (!use_dense) Z <- Matrix(Z, sparse = TRUE)
+        Z_tilde <- as.matrix(UtAU_block(U_blocks = U0_blocks, A = Z, symmetric_A = TRUE))
+      } else if (penalty == "l21_groups") {
+        W <- if (use_dense) {
+          U0 %*% W_tilde %*% t(U0)
+        } else {
+          as.matrix(prox_l1_from_tilde_blockwise(
+            W_tilde = W_tilde,
+            U_blocks = U0_blocks,
+            tau = 0,
+            symmetric = TRUE,
+            drop_tol = 0
+          ))
+        }
+        Z <- .prox_l21_groups(W, lambda_over_rho = (lambda / rho), groups_l21 = groups_l21, group_weights = group_weights)
+        if (!use_dense) Z <- Matrix(Z, sparse = TRUE)
+        Z_tilde <- as.matrix(UtAU_block(U_blocks = U0_blocks, A = Z, symmetric_A = TRUE))
       } else {
-        Z <- Z_tilde
-        idx <- (mask == 1)
-        Z[idx] <- soft_threshold(Z_tilde[idx], (lambda / rho) * weight[idx])
+        stop("Unsupported penalty type: ", penalty)
       }
-    } else if (penalty == "l21_rows") {
-      Z <- .prox_l21_rows(Z_tilde, tau = (lambda / rho), mask = mask, row_weights = row_weights)
-    } else if (penalty == "l21_groups") {
-      Z <- .prox_l21_groups(Z_tilde, lambda_over_rho = (lambda / rho),
-                            groups_l21 = groups_l21,
-                            group_weights = group_weights)
-    }
-
-    if (symmetrize_z) Z <- (Z + t(Z)) / 2
-
-    # ----- dual update (scaled) -----
-    U_dual <- U_dual + (C - Z)
-
-    # ----- diagnostics / stopping -----
-    r_norm <- base::norm(C - Z, "F")
-    s_norm <- rho * base::norm(Z - Z_prev, "F")
-    eps_pri <- sqrt(p_all * p_all) * abs_tol + rel_tol * max(base::norm(C, "F"), base::norm(Z, "F"))
-    eps_dual <- sqrt(p_all * p_all) * abs_tol + rel_tol * rho * base::norm(U_dual, "F")
-
-    if (isTRUE(verbose) && iter %% 50 == 0) {
-      cat(sprintf("iter %5d  r=%.3e  s=%.3e  eps_pri=%.3e  eps_dual=%.3e  rho=%.3g\n",
-                  iter, r_norm, s_norm, eps_pri, eps_dual, rho))
-    }
-
-    if (r_norm <= eps_pri && s_norm <= eps_dual) {
-      converged <- TRUE
-      break
-    }
-
-    # ----- adaptive rho (optional) -----
-    if (isTRUE(adapt_rho)) {
-      if (r_norm > mu * s_norm) {
-        rho <- rho * tau_incr
-        U_dual <- U_dual / tau_incr
-        denom <- rho + outer_term
-      } else if (s_norm > mu * r_norm) {
-        rho <- rho / tau_decr
-        U_dual <- U_dual * tau_decr
-        denom <- rho + outer_term
+      
+      U_dual_tilde <- U_dual_tilde + (C_tilde - Z_tilde)
+      
+      r_norm <- base::norm(C_tilde - Z_tilde, "F")
+      s_norm <- rho * base::norm(Z_tilde - Z_tilde_prev, "F")
+      eps_pri <- r_tot * abs_tol + rel_tol * max(base::norm(C_tilde, "F"), base::norm(Z_tilde, "F"))
+      eps_dual <- r_tot * abs_tol + rel_tol * rho * base::norm(U_dual_tilde, "F")
+      if (isTRUE(verbose) && iter %% 50 == 0) {
+        cat(sprintf("iter %5d  r=%.3e  s=%.3e  eps_pri=%.3e  eps_dual=%.3e  rho=%.3g\n",
+                    iter, r_norm, s_norm, eps_pri, eps_dual, rho))
+      }
+      if (r_norm <= eps_pri && s_norm <= eps_dual) {
+        converged <- TRUE
+        break
+      }
+      if (isTRUE(adapt_rho)) {
+        if (r_norm > mu * s_norm) {
+          rho <- rho * tau_incr
+          U_dual_tilde <- U_dual_tilde / tau_incr
+          denom <- rho + outer_term
+        } else if (s_norm > mu * r_norm) {
+          rho <- rho / tau_decr
+          U_dual_tilde <- U_dual_tilde * tau_decr
+          denom <- rho + outer_term
+        }
       }
     }
+
   }
+  
 
-  # By default, CV only needs C. Canonical directions are optional.
+  
   out <- list(
-    C = C,
-    Z = Z,
-    U_dual = U_dual,
+    C_tilde = C_tilde,
+    Z_tilde = Z_tilde,
+    U_dual_tilde = U_dual_tilde,
     rho = rho,
     iter = iter_final,
     converged = converged,
-    C_sparsity = mean(abs(C) < prep$sparsity_threshold)
+    mode = if (use_dense) "dense" else "sparse",
+    C_sparsity = if (use_dense) mean(abs(Z) < prep$sparsity_threshold) else 1 - Matrix::nnzero(Z)/(p_all * p_all)
   )
-
+  
   if (isTRUE(compute_canon)) {
-    Sigma0_sqrt <- prep$Sigma0_sqrt
-    target <- matmul(Sigma0_sqrt, matmul(C, Sigma0_sqrt))
-    eU <- top_eigs_sym(target, r)
-    U_svd <- eU$vectors
-    # Not over ---- need to compute the correct normalization
-    if (r == 1){
-      U_canon <- matmul(C, Sigma0_sqrt) %*% U_svd  * 1/eU$values
-    }else{
-      U_canon <- matmul(C, Sigma0_sqrt) %*% U_svd %*% diag(1/eU$values)
-    }
+    r_eff <- min(as.integer(r), nrow(C_tilde))
+    if (r_eff < 1L) stop("No valid canonical direction can be computed.")
+    eC <- top_eigs_sym(C_tilde, r_eff)
+    V_tilde  <- eC$vectors          # r_all x r
+    mu       <- eC$values
     
+    U_svd <- if (use_dense) U0 %*% eC$vectors else apply_U_blocks(U0_blocks, eC$vectors)
+    
+    # 3) canonical normalization: B = V_tilde^T * diag(lam2) * V_tilde
+    lam2 <- unlist(prep$Sigma0_eigen$lam_blocks, use.names = FALSE)
 
-    # normalize to enforce U^T Sigma0 U = I
-    #B <- matmul(t(U_svd), matmul(prep$Sigma0, U_svd))
-    #U_canon <- matmul(U_svd, sym_inv_sqrt(B))
-
+    LV   <-  diag(lam2)  %*% V_tilde                 # rowwise multiply
+    Bmat <- matmul(t(V_tilde), LV)         # r x r
+    
+    # 4) enforce U^T Sigma0 U = I
+    
+    U_canon <- U_svd %*% sym_inv_sqrt(Bmat)
+    
     out$U <- U_canon
-    out$cor <- sqrt(pmax(eU$values, 0))
     out$U_sparsity <- mean(abs(U_canon) < prep$sparsity_threshold)
+    
   }
-
   out
 }
-
 # -------------------------------------------------------------------
 # Main CV function: parallel over folds, warm start over lambdas
 # -------------------------------------------------------------------
@@ -463,21 +997,20 @@ sgcar_cv_folds <- function(
   r,
   K = 5,
   folds = NULL,
-  seed = NULL,
+  seed = 2026,
+  center_X = TRUE,
   penalty = c("l1", "l21_rows", "l21_groups"),
-  penalize = c("offdiag", "all", "block"),
-  loss_part = c("auto", "all", "offdiag", "block_off"),
-  loss_weight = NULL,
+  loss_part = c("auto", "all"),
   relative_loss = TRUE,
   lambda_order = c("decreasing", "increasing", "as_is"),
   warm_start = c("CZU", "C_only", "none"),
   # solver controls
-  rho = 1,
-  weight = NULL,
-  row_weights = NULL,
+  rho = NA,
   groups_l21 = NULL,
-  group_weights = NULL,
   symmetrize_z = TRUE,
+  representation = c("auto", "dense", "sparse"),
+  dense_dim_threshold = 2000L,
+  sparse_density_threshold = 0.10,
   max_iter = 4000,
   abs_tol = 1e-4,
   rel_tol = 1e-3,
@@ -495,14 +1028,18 @@ sgcar_cv_folds <- function(
 ) {
 
   penalty <- match.arg(penalty)
-  penalize <- match.arg(penalize)
   loss_part <- match.arg(loss_part)
   lambda_order <- match.arg(lambda_order)
   warm_start <- match.arg(warm_start)
+  representation <- match.arg(representation)
 
   .log <- function(...) if (isTRUE(verbose)) cat(sprintf(...), "\n")
 
   X <- as.matrix(X)
+  if (isTRUE(center_X)){
+    X = scale(X, center = TRUE, scale = FALSE)  # center columns
+  }
+  
   n <- nrow(X)
   p <- ncol(X)
   stopifnot(sum(p_list) == p)
@@ -519,25 +1056,17 @@ sgcar_cv_folds <- function(
     stopifnot(K >= 2)
   }
 
-  # Effective loss part
-  part_eff <- if (loss_part == "auto") {
-    if (penalize == "offdiag") "offdiag" else if (penalize == "block") "block_off" else "all"
-  } else {
-    loss_part
-  }
+  # Effective loss part (only "all" is supported now).
+  part_eff <- "all"
 
   lambdas <- as.numeric(lambdas)
   L <- length(lambdas)
 
   .log("[cv] n=%d p=%d | K=%d folds | L=%d lambdas", n, p, K, L)
-  .log("[cv] penalty=%s | penalize=%s | loss_part=%s | warm_start=%s | lambda_order=%s",
-       penalty, penalize, part_eff, warm_start, lambda_order)
+  .log("[cv] penalty=%s | loss_part=%s | warm_start=%s | lambda_order=%s",
+       penalty, part_eff, warm_start, lambda_order)
 
-  # Full-data second moment
-  M_full <- crossprod(X)
-  S_full <- (M_full / n)
-  S_full <- (S_full + t(S_full)) / 2
-  S0_full <- .bd_from_S(S_full, p_list)
+
 
   # Precompute fold stats (down-dated from M_full)
   .log("[cv] precompute fold moments...")
@@ -549,26 +1078,29 @@ sgcar_cv_folds <- function(
     if (n_tr <= 1) stop("A training fold has <= 1 sample. Reduce K.")
 
     Xval <- X[idx_val, , drop = FALSE]
-    M_val <- crossprod(Xval)
+    Xtrain <- X[-idx_val, , drop = FALSE]
+    # M_val <- crossprod(Xval)
 
-    S_va <- (M_val / n_val)
-    S_va <- (S_va + t(S_va)) / 2
+    # S_va <- (M_val / n_val)
+    # S_va <- (S_va + t(S_va)) / 2
 
-    S_tr <- ((M_full - M_val) / n_tr)
-    S_tr <- (S_tr + t(S_tr)) / 2
+    # S_tr <- ((M_full - M_val) / n_tr)
+    # S_tr <- (S_tr + t(S_tr)) / 2
 
-    S0_tr <- .bd_from_S(S_tr, p_list)
-    S0_va <- .bd_from_S(S_va, p_list)
+    # S0_tr <- .bd_from_S(S_tr, p_list)
+    # S0_va <- .bd_from_S(S_va, p_list)
 
     fold_stats[[k]] <- list(
       k = k,
-      S_tr = S_tr,
-      S0_tr = S0_tr,
-      S_va = S_va,
-      S0_va = S0_va
+      Xval = Xval,
+      Xtrain = Xtrain
+      # S_tr = S_tr,
+      # S0_tr = S0_tr,
+      # S_va = S_va,
+      # S0_va = S0_va
     )
   }
-  .log("[cv] precompute done")
+
 
   # Storage: L x K
   cv_mat <- matrix(NA_real_, nrow = L, ncol = K,
@@ -589,16 +1121,11 @@ sgcar_cv_folds <- function(
     k <- fs$k
 
     prep <- .admm_sgca_prepare(
-      Sigma = fs$S_tr,
-      Sigma0 = fs$S0_tr,
+      X = fs$Xtrain,
       rho = rho,
       p_list = p_list,
       penalty = penalty,
-      penalize = penalize,
-      weight = weight,
-      row_weights = row_weights,
       groups_l21 = groups_l21,
-      group_weights = group_weights,
       symmetrize_z = symmetrize_z,
       sparsity_threshold = sparsity_threshold
     )
@@ -625,6 +1152,9 @@ sgcar_cv_folds <- function(
           mu = mu,
           tau_incr = tau_incr,
           tau_decr = tau_decr,
+          representation = representation,
+          dense_dim_threshold = dense_dim_threshold,
+          sparse_density_threshold = sparse_density_threshold,
           verbose = FALSE,
           compute_canon = TRUE
         )
@@ -636,9 +1166,14 @@ sgcar_cv_folds <- function(
         losses[li] <- NA_real_
         # do not update state if the fit failed
       } else {
+        U_fit <- fit$U
+        if (is.null(U_fit)) {
+          losses[li] <- NA_real_
+          next
+        }
         losses[li] <- .cv_loss(
-          U_hat = fit$U,
-          Sigma_val = fs$S_va,
+          U_hat = U_fit,
+          X_val = fs$Xval,
           p_list = p_list
         )
         if (losses[li] ==0){
@@ -701,8 +1236,9 @@ sgcar_cv_folds <- function(
       # export required functions to PSOCK workers (harmless on FORK)
       exports <- c(
         "%||%", "matmul", "soft_threshold", "sym_inv_sqrt", "top_eigs_sym",
+        "UtAU_block", "prox_l1_from_tilde_blockwise",
         ".prox_l21_rows", ".prox_l21_groups",
-        ".make_folds", ".mask_from_part", ".bd_from_S", ".cv_loss",
+        ".make_folds", ".bd_from_S", ".cv_loss",
         ".admm_sgca_prepare", ".admm_sgca_run"
       )
       parallel::clusterExport(cl, varlist = exports, envir = environment())
@@ -710,11 +1246,12 @@ sgcar_cv_folds <- function(
       # also export scalar/vector configs used inside worker closure
       parallel::clusterExport(
         cl,
-        varlist = c("p_list", "lambdas", "L", "r", "rho", "penalty", "penalize",
-                    "weight", "row_weights", "groups_l21", "group_weights",
+        varlist = c("p_list", "lambdas", "L", "r", "rho", "penalty",
+                    "groups_l21",
                     "symmetrize_z", "max_iter", "abs_tol", "rel_tol", "adapt_rho",
-                    "mu", "tau_incr", "tau_decr", "sparsity_threshold",
-                    "lam_ord", "part_eff", "loss_weight", "relative_loss", "warm_start"),
+                    "mu", "tau_incr", "tau_decr", "representation", "dense_dim_threshold",
+                    "sparse_density_threshold", "sparsity_threshold",
+                    "lam_ord", "part_eff", "relative_loss", "warm_start"),
         envir = environment()
       )
 
@@ -778,16 +1315,11 @@ sgcar_cv_folds <- function(
 
   # Refit on full data (compute canonical directions)
   prep_full <- .admm_sgca_prepare(
-    Sigma = S_full,
-    Sigma0 = S0_full,
+    X = X,
     rho = rho,
     p_list = p_list,
     penalty = penalty,
-    penalize = penalize,
-    weight = weight,
-    row_weights = row_weights,
     groups_l21 = groups_l21,
-    group_weights = group_weights,
     symmetrize_z = symmetrize_z,
     sparsity_threshold = sparsity_threshold
   )
@@ -805,6 +1337,9 @@ sgcar_cv_folds <- function(
     mu = mu,
     tau_incr = tau_incr,
     tau_decr = tau_decr,
+    representation = representation,
+    dense_dim_threshold = dense_dim_threshold,
+    sparse_density_threshold = sparse_density_threshold,
     verbose = FALSE,
     compute_canon = TRUE
   )
@@ -820,13 +1355,13 @@ sgcar_cv_folds <- function(
     K = K,
     r = r,
     penalty = penalty,
-    penalize = penalize,
     loss_part = part_eff,
     relative_loss = relative_loss,
     did_parallel = did_parallel,
     parallel_failed_reason = parallel_failed_reason,
     lambda_order = lambda_order,
-    warm_start = warm_start
+    warm_start = warm_start,
+    prep_full = prep_full
   )
   class(out) <- "cv_sgcar"
   out
